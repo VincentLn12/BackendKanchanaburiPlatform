@@ -6,7 +6,7 @@ namespace API.Controllers;
 
 [ApiController]
 [Route("api/payments")]
-public sealed class PaymentsController(IUnitOfWork unit, IConfiguration configuration) : ControllerBase
+public sealed class PaymentsController(IUnitOfWork unit, IConfiguration configuration, ILogger<PaymentsController> logger) : ControllerBase
 {
     [HttpPost("orders/{orderId:guid}/intent"), Authorize]
     public async Task<ActionResult<CreatePaymentIntentResponse>> CreateIntent(Guid orderId)
@@ -41,9 +41,39 @@ public sealed class PaymentsController(IUnitOfWork unit, IConfiguration configur
         var json = await new StreamReader(HttpContext.Request.Body).ReadToEndAsync();
         Event stripeEvent;
         var webhookSecret = configuration["Stripe:WebhookSecret"];
-        if (string.IsNullOrWhiteSpace(webhookSecret)) return Problem("Stripe:WebhookSecret is not configured", statusCode: StatusCodes.Status503ServiceUnavailable);
-        try { stripeEvent = EventUtility.ConstructEvent(json, Request.Headers["Stripe-Signature"], webhookSecret); }
-        catch (StripeException) { return BadRequest(); }
+        if (string.IsNullOrWhiteSpace(webhookSecret)) 
+        {
+            logger.LogError("Stripe Webhook Error: Stripe:WebhookSecret is not configured.");
+            return Problem("Stripe:WebhookSecret is not configured", statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
+
+        try 
+        { 
+            var signatureHeader = Request.Headers["Stripe-Signature"];
+            if (string.IsNullOrEmpty(signatureHeader))
+            {
+                logger.LogWarning("Stripe Webhook Error: Stripe-Signature header missing");
+                return BadRequest("Stripe-Signature header missing");
+            }
+            // The Dashboard endpoint can use an API version different from the
+            // installed Stripe.net version. Keep signature verification enabled,
+            // but allow that version mismatch.
+            stripeEvent = EventUtility.ConstructEvent(
+                json,
+                signatureHeader,
+                webhookSecret,
+                throwOnApiVersionMismatch: false);
+        }
+        catch (StripeException ex) 
+        { 
+            logger.LogError(ex, "Stripe Webhook Verification Failed: {Message}", ex.Message);
+            return BadRequest($"Webhook Signature Failed: {ex.Message}"); 
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Stripe Webhook Processing Error: {Message}", ex.Message);
+            return BadRequest($"Webhook Error: {ex.Message}");
+        }
 
         if (stripeEvent.Type == "payment_intent.payment_failed")
         {
